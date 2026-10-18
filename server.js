@@ -8,8 +8,9 @@ const connectDB = require('./config/db');
 const authRoutes = require('./routes/authRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const messageRoutes = require('./routes/messageRoutes');
-const Message = require('./models/Message'); // Ensure Message model is imported
-const User = require('./models/User'); // Imported User model for lastSeen tracking
+const callRoutes = require('./routes/callRoutes'); // 📞 Import call routes
+const Message = require('./models/Message'); 
+const User = require('./models/User'); 
 
 const app = express();
 
@@ -31,6 +32,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/users', authRoutes); 
 app.use('/api/chats', chatRoutes);
 app.use('/api/messages', messageRoutes);
+app.use('/api/calls', callRoutes); // 📞 Mount call history endpoints
 
 // Create HTTP & Socket.IO server
 const server = http.createServer(app);
@@ -44,8 +46,9 @@ const io = new Server(server, {
 // Bind io to express app so REST controllers can trigger socket emissions
 app.set('io', io);
 
-// Store connected online users: Map(userId -> socketId)
+// Store connected online users: Map(userId -> Set<socketId>)
 const onlineUsers = new Map();
+const activeCalls = new Map();
 
 // Socket.IO Connection Handler
 io.on('connection', (socket) => {
@@ -55,8 +58,11 @@ io.on('connection', (socket) => {
     socket.on('setup_user', (userId) => {
         if (userId) {
             const uidStr = String(userId);
-            socket.userId = uidStr; // Bind userId to socket instance
-            onlineUsers.set(uidStr, socket.id);
+            socket.userId = uidStr;
+            const userSockets = onlineUsers.get(uidStr) || new Set();
+            userSockets.add(socket.id);
+            onlineUsers.set(uidStr, userSockets);
+            socket.join(`user:${uidStr}`);
             
             // Broadcast online list and online status update
             io.emit('get_online_users', Array.from(onlineUsers.keys()));
@@ -108,32 +114,26 @@ io.on('connection', (socket) => {
             const message = await Message.findById(messageId);
             if (!message) return;
 
-            // Check if user has already reacted
             const existingIndex = message.reactions.findIndex(
                 (r) => r.user.toString() === userId.toString()
             );
 
             if (existingIndex > -1) {
                 if (message.reactions[existingIndex].emoji === emoji) {
-                    // Toggle off if clicking the same emoji
                     message.reactions.splice(existingIndex, 1);
                 } else {
-                    // Switch emoji if clicking a different one
                     message.reactions[existingIndex].emoji = emoji;
                 }
             } else {
-                // Add new reaction
                 message.reactions.push({ user: userId, emoji });
             }
 
             await message.save();
 
-            // Populate user details for frontend rendering
             const updatedMessage = await Message.findById(messageId)
                 .populate('sender', 'name username avatar')
                 .populate('reactions.user', 'name username');
 
-            // Broadcast update to the room
             io.to(conversationId).emit('message_updated', updatedMessage);
             socket.to(conversationId).emit('message_updated', updatedMessage);
         } catch (err) {
@@ -173,30 +173,30 @@ io.on('connection', (socket) => {
     socket.on('disconnect', async () => {
         console.log('User disconnected from socket:', socket.id);
         
-        let disconnectedUserId = socket.userId;
-
-        // Fallback search if socket.userId was not set directly
-        if (!disconnectedUserId) {
-            for (let [uId, sId] of onlineUsers.entries()) {
-                if (sId === socket.id) {
-                    disconnectedUserId = uId;
-                    break;
-                }
+        const disconnectedUserId = socket.userId;
+        for (const [callId, call] of activeCalls.entries()) {
+            if (call.callerSocketId === socket.id || call.targetSocketId === socket.id) {
+                const otherSocketId = call.callerSocketId === socket.id
+                    ? call.targetSocketId
+                    : call.callerSocketId;
+                io.to(otherSocketId).emit('call_ended', { callId, status: 'missed' });
+                activeCalls.delete(callId);
             }
         }
 
         if (disconnectedUserId) {
+            const userSockets = onlineUsers.get(disconnectedUserId);
+            userSockets?.delete(socket.id);
+            if (userSockets?.size) return;
             onlineUsers.delete(disconnectedUserId);
             const lastSeenTime = new Date();
 
-            // Persist lastSeen to MongoDB
             try {
                 await User.findByIdAndUpdate(disconnectedUserId, { lastSeen: lastSeenTime });
             } catch (err) {
                 console.error('Failed to update lastSeen in DB:', err);
             }
 
-            // Emit updated online list and status update to all connected clients
             io.emit('get_online_users', Array.from(onlineUsers.keys()));
             io.emit('user_status_change', {
                 userId: disconnectedUserId,
@@ -206,35 +206,60 @@ io.on('connection', (socket) => {
         }
     });
 
-    // User initiates a call
-    socket.on('call_user', ({ userToCall, signalData, from, callType, name }) => {
-        const targetSocketId = onlineUsers.get(String(userToCall));
+    // 📞 User initiates a call (Signaling relay)
+    socket.on('call_user', ({ callId, userToCall, signalData, from, callType, name, avatar }) => {
+        const targetId = String(userToCall || '');
+        const callerId = socket.userId || String(from || '');
+        const targetSocketIds = onlineUsers.get(targetId);
+        const targetSocketId = targetSocketIds ? Array.from(targetSocketIds).at(-1) : null;
+        if (!callId || !targetSocketId || !callerId) {
+            if (callId) socket.emit('call_ended', { callId, status: 'missed' });
+            return;
+        }
+
+        activeCalls.set(callId, {
+            callerId,
+            targetId,
+            callerSocketId: socket.id,
+            targetSocketId,
+            accepted: false,
+        });
+
         if (targetSocketId) {
             io.to(targetSocketId).emit('incoming_call', {
+                callId,
                 signal: signalData,
-                from,
+                from: callerId,
                 callType,
-                name
+                name,
+                avatar 
             });
-        } else {
-            console.log(`User ${userToCall} is not connected in onlineUsers map.`);
         }
     });
 
-    // User answers an incoming call
+    // User answers an incoming call (Relays answer signal back to caller)
     socket.on('answer_call', (data) => {
-        const targetSocketId = onlineUsers.get(String(data.to));
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('call_accepted', data.signal);
-        }
+        const call = activeCalls.get(data.callId);
+        if (!call || call.targetSocketId !== socket.id || call.accepted) return;
+        call.accepted = true;
+        io.to(call.callerSocketId).emit('call_accepted', {
+            callId: data.callId,
+            signal: data.signal,
+        });
     });
 
     // Handle call hangup / rejection
-    socket.on('hang_up', ({ to }) => {
-        const targetSocketId = onlineUsers.get(String(to));
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('call_ended');
-        }
+    socket.on('hang_up', ({ callId, status }) => {
+        const call = activeCalls.get(callId);
+        if (!call) return;
+        const targetSocketId = call.callerSocketId === socket.id
+            ? call.targetSocketId
+            : call.targetSocketId === socket.id
+                ? call.callerSocketId
+                : null;
+        if (!targetSocketId) return;
+        io.to(targetSocketId).emit('call_ended', { callId, status });
+        activeCalls.delete(callId);
     });
 });
 

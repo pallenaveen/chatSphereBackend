@@ -22,6 +22,7 @@ exports.registerUser = async (req, res) => {
             username: user.username,
             email: user.email,
             avatar: user.avatar, // Added avatar here
+            bio: user.bio,
             token: generateToken(user._id)
         });
     } catch (error) {
@@ -40,6 +41,7 @@ exports.loginUser = async (req, res) => {
                 username: user.username,
                 email: user.email,
                 avatar: user.avatar, // Added avatar here so it appears right on login!
+                bio: user.bio,
                 token: generateToken(user._id)
             });
         } else {
@@ -73,10 +75,28 @@ exports.allUsers = async (req, res) => {
     }
 };
 
+exports.getUserProfile = async (req, res) => {
+    try {
+        const user = await User.findById(req.params.userId)
+            .select('_id username email avatar bio lastSeen isOnline');
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        return res.status(200).json(user);
+    } catch (error) {
+        if (error.name === 'CastError') {
+            return res.status(400).json({ message: 'Invalid user ID' });
+        }
+        return res.status(500).json({ message: error.message });
+    }
+};
+
 // Update user profile (username or avatar)
 exports.updateProfile = async (req, res) => {
     try {
-        const { username, avatar } = req.body;
+        const { username, avatar, bio } = req.body;
         const userId = req.user?._id || req.user?.id;
 
         if (!userId) {
@@ -103,6 +123,17 @@ exports.updateProfile = async (req, res) => {
             updateData.avatar = avatar;
         }
 
+        if (bio !== undefined) {
+            if (typeof bio !== 'string') {
+                return res.status(400).json({ message: "Bio must be text" });
+            }
+            const trimmedBio = bio.trim();
+            if (trimmedBio.length > 139) {
+                return res.status(400).json({ message: "Bio cannot exceed 139 characters" });
+            }
+            updateData.bio = trimmedBio;
+        }
+
         const updatedUser = await User.findByIdAndUpdate(
             userId,
             updateData,
@@ -120,6 +151,7 @@ exports.updateProfile = async (req, res) => {
                 userId: updatedUser._id,
                 username: updatedUser.username,
                 avatar: updatedUser.avatar,
+                bio: updatedUser.bio,
             });
         }
         // ================================
@@ -129,6 +161,7 @@ exports.updateProfile = async (req, res) => {
             username: updatedUser.username,
             email: updatedUser.email,
             avatar: updatedUser.avatar,
+            bio: updatedUser.bio,
         });
     } catch (error) {
         console.error("Error updating profile:", error);
