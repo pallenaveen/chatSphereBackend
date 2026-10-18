@@ -7,7 +7,13 @@ const protect = (req, res, next) => {
     try {
       const token = authHeader.split(' ')[1];
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.user = decoded;
+      const userId = decoded._id || decoded.id;
+
+      if (!userId) {
+        return res.status(401).json({ message: 'Not authorized, user ID missing from token' });
+      }
+
+      req.user = { ...decoded, _id: userId };
       return next();
     } catch (error) {
       return res.status(401).json({ message: 'Not authorized, token failed' });
