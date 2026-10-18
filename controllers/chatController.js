@@ -2,6 +2,8 @@ const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const User = require('../models/User');
 const mongoose = require('mongoose');
+const { findConversationForMember } = require('../utils/conversationAccess');
+const { emitToConversationMembers } = require('../utils/realtime');
 
 // Create 1-on-1 conversation or return existing
 const accessChat = async (req, res) => {
@@ -12,8 +14,16 @@ const accessChat = async (req, res) => {
   if (!targetUserId) {
     return res.status(400).json({ message: 'friendId is required' });
   }
+  if (!mongoose.Types.ObjectId.isValid(targetUserId) || String(targetUserId) === String(currentUserId)) {
+    return res.status(400).json({ message: 'A valid other user ID is required' });
+  }
 
   try {
+    const targetUser = await User.exists({ _id: targetUserId });
+    if (!targetUser) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
     const currentObjId = new mongoose.Types.ObjectId(currentUserId);
     const friendObjId = new mongoose.Types.ObjectId(targetUserId);
 
@@ -21,12 +31,12 @@ const accessChat = async (req, res) => {
       isGroup: false,
       members: { $size: 2, $all: [currentObjId, friendObjId] }
     })
-      .populate("members", "-password")
+      .populate("members", "username avatar bio lastSeen isOnline")
       .populate("latestMessage");
 
     isChat = await User.populate(isChat, {
       path: "latestMessage.sender",
-      select: "username email"
+      select: "username avatar"
     });
 
     if (isChat.length > 0) {
@@ -38,7 +48,12 @@ const accessChat = async (req, res) => {
         members: [currentObjId, friendObjId]
       });
 
-      const fullChat = await Conversation.findOne({ _id: newChat._id }).populate("members", "-password");
+      const fullChat = await Conversation.findOne({ _id: newChat._id })
+        .populate("members", "username avatar bio lastSeen isOnline");
+      const io = req.app.get('io');
+      if (io) {
+        emitToConversationMembers(io, newChat, 'conversation_created', fullChat);
+      }
       return res.status(200).json(fullChat);
     }
   } catch (error) {
@@ -54,15 +69,15 @@ const fetchChats = async (req, res) => {
     const currentObjId = new mongoose.Types.ObjectId(currentUserId);
 
     let chats = await Conversation.find({ members: { $in: [currentObjId] } })
-      .populate("members", "-password")
-      .populate("groupAdmin", "-password")
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar")
       .populate("latestMessage")
       .sort({ updatedAt: -1 })
       .lean();
 
     chats = await User.populate(chats, {
       path: "latestMessage.sender",
-      select: "username email"
+      select: "username avatar"
     });
 
     const chatsWithUnreadCount = await Promise.all(
@@ -92,21 +107,16 @@ const markMessagesAsRead = async (req, res) => {
   const currentUserId = req.user._id || req.user.id;
 
   try {
-    const currentObjId = new mongoose.Types.ObjectId(currentUserId);
-    
-    let chatObjId;
-    try {
-      chatObjId = new mongoose.Types.ObjectId(chatId);
-    } catch (e) {
-      chatObjId = chatId;
+    const conversation = await findConversationForMember(chatId, currentUserId);
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found' });
     }
+
+    const currentObjId = new mongoose.Types.ObjectId(currentUserId);
 
     await Message.updateMany(
       {
-        $or: [
-          { conversationId: chatId },
-          { conversationId: chatObjId }
-        ],
+        conversationId: conversation._id,
         sender: { $ne: currentObjId },
         readBy: { $ne: currentObjId }
       },
@@ -115,9 +125,9 @@ const markMessagesAsRead = async (req, res) => {
 
     const io = req.app.get('io');
     if (io) {
-      io.to(chatId).emit('chat_marked_read', {
+      emitToConversationMembers(io, conversation, 'chat_marked_read', {
         conversationId: chatId,
-        userId: currentUserId
+        userId: String(currentUserId),
       });
     }
 
@@ -131,8 +141,17 @@ const markMessagesAsRead = async (req, res) => {
 const deleteChat = async (req, res) => {
   try {
     const chatId = req.params.id;
-    await Message.deleteMany({ conversationId: chatId });
-    await Conversation.findByIdAndDelete(chatId);
+    const conversation = await findConversationForMember(chatId, req.user._id);
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found' });
+    }
+    if (conversation.isGroup && String(conversation.groupAdmin) !== String(req.user._id)) {
+      return res.status(403).json({ message: 'Only the group admin can delete this group' });
+    }
+
+    await Message.deleteMany({ conversationId: conversation._id });
+    await conversation.deleteOne();
+    req.app.get('io')?.in(String(conversation._id)).socketsLeave(String(conversation._id));
     res.status(200).json({ message: 'Chat deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -148,15 +167,26 @@ const createGroupChat = async (req, res) => {
     return res.status(400).json({ message: 'Please fill all fields' });
   }
 
-  let parsedMembers = Array.isArray(members)
-    ? members
-    : Array.isArray(users)
-      ? users
-      : typeof members === 'string'
-        ? JSON.parse(members)
-        : typeof users === 'string'
-          ? JSON.parse(users)
-          : [];
+  let parsedMembers;
+  try {
+    parsedMembers = Array.isArray(members)
+      ? members
+      : Array.isArray(users)
+        ? users
+        : typeof members === 'string'
+          ? JSON.parse(members)
+          : typeof users === 'string'
+            ? JSON.parse(users)
+            : [];
+  } catch {
+    return res.status(400).json({ message: 'Members must be a valid list of user IDs' });
+  }
+
+  if (!Array.isArray(parsedMembers) || parsedMembers.some((id) => !mongoose.Types.ObjectId.isValid(id))) {
+    return res.status(400).json({ message: 'Members must be valid user IDs' });
+  }
+
+  parsedMembers = [...new Set(parsedMembers.map(String))];
 
   if (parsedMembers.length < 2) {
     return res.status(400).json({ message: 'At least 2 members are required to form a group chat' });
@@ -167,6 +197,11 @@ const createGroupChat = async (req, res) => {
   }
 
   try {
+    const existingUsers = await User.countDocuments({ _id: { $in: parsedMembers } });
+    if (existingUsers !== parsedMembers.length) {
+      return res.status(400).json({ message: 'One or more group members do not exist' });
+    }
+
     const groupChat = await Conversation.create({
       chatName: name,
       isGroup: true,
@@ -175,13 +210,13 @@ const createGroupChat = async (req, res) => {
     });
 
     const fullGroupChat = await Conversation.findOne({ _id: groupChat._id })
-      .populate("members", "-password")
-      .populate("groupAdmin", "-password");
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar");
 
     const io = req.app.get('io');
     if (io) {
       parsedMembers.forEach((memberId) => {
-        io.to(String(memberId)).emit('group_created', fullGroupChat);
+        io.to(`user:${String(memberId)}`).emit('group_created', fullGroupChat);
       });
     }
 
@@ -204,13 +239,24 @@ const renameGroup = async (req, res) => {
   if (avatar !== undefined) updateFields.avatar = avatar;
 
   try {
+    const conversation = await findConversationForMember(chatId, req.user._id);
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found' });
+    }
+    if (!conversation.isGroup) {
+      return res.status(400).json({ message: 'Only group conversations can be updated here' });
+    }
+    if (String(conversation.groupAdmin) !== String(req.user._id)) {
+      return res.status(403).json({ message: 'Only the group admin can update this group' });
+    }
+
     const updatedChat = await Conversation.findByIdAndUpdate(
       chatId,
       { $set: updateFields },
       { new: true }
     )
-      .populate("members", "-password")
-      .populate("groupAdmin", "-password");
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar");
 
     if (!updatedChat) {
       return res.status(404).json({ message: "Conversation Not Found" });
@@ -232,13 +278,31 @@ const addToGroup = async (req, res) => {
   const { chatId, userId } = req.body;
 
   try {
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: 'A valid user ID is required' });
+    }
+
+    const conversation = await findConversationForMember(chatId, req.user._id);
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found' });
+    }
+    if (!conversation.isGroup) {
+      return res.status(400).json({ message: 'Members can only be added to groups' });
+    }
+    if (String(conversation.groupAdmin) !== String(req.user._id)) {
+      return res.status(403).json({ message: 'Only the group admin can add members' });
+    }
+    if (!await User.exists({ _id: userId })) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
     const added = await Conversation.findByIdAndUpdate(
       chatId,
       { $addToSet: { members: userId } },
       { new: true }
     )
-      .populate("members", "-password")
-      .populate("groupAdmin", "-password");
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar");
 
     if (!added) {
       return res.status(404).json({ message: "Conversation Not Found" });
@@ -248,7 +312,7 @@ const addToGroup = async (req, res) => {
     const io = req.app.get('io');
     if (io) {
       io.to(chatId).emit('group_updated', added);
-      io.to(String(userId)).emit('group_created', added); // Notify newly added user
+      io.to(`user:${String(userId)}`).emit('group_created', added);
     }
 
     res.status(200).json(added);
@@ -262,13 +326,34 @@ const removeFromGroup = async (req, res) => {
   const { chatId, userId } = req.body;
 
   try {
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: 'A valid user ID is required' });
+    }
+
+    const conversation = await findConversationForMember(chatId, req.user._id);
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found' });
+    }
+    if (!conversation.isGroup) {
+      return res.status(400).json({ message: 'Members can only be removed from groups' });
+    }
+    if (String(conversation.groupAdmin) !== String(req.user._id)) {
+      return res.status(403).json({ message: 'Only the group admin can remove members' });
+    }
+    if (String(conversation.groupAdmin) === String(userId)) {
+      return res.status(400).json({ message: 'The group admin cannot remove themselves' });
+    }
+    if (!conversation.members.some((member) => String(member) === String(userId))) {
+      return res.status(404).json({ message: 'User is not a member of this group' });
+    }
+
     const removed = await Conversation.findByIdAndUpdate(
       chatId,
       { $pull: { members: userId } },
       { new: true }
     )
-      .populate("members", "-password")
-      .populate("groupAdmin", "-password");
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar");
 
     if (!removed) {
       return res.status(404).json({ message: "Conversation Not Found" });
@@ -278,6 +363,7 @@ const removeFromGroup = async (req, res) => {
     const io = req.app.get('io');
     if (io) {
       io.to(chatId).emit('group_updated', removed);
+      io.in(`user:${String(userId)}`).socketsLeave(String(chatId));
     }
 
     res.status(200).json(removed);
@@ -292,13 +378,18 @@ const toggleFavorite = async (req, res) => {
   const { isFavorite } = req.body;
 
   try {
+    const conversation = await findConversationForMember(chatId, req.user._id);
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found' });
+    }
+
     const updatedChat = await Conversation.findByIdAndUpdate(
       chatId,
       { isFavorite: isFavorite },
       { new: true }
     )
-      .populate("members", "-password")
-      .populate("groupAdmin", "-password");
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar");
 
     if (!updatedChat) {
       return res.status(404).json({ message: "Conversation Not Found" });

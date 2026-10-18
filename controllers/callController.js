@@ -1,4 +1,6 @@
 const CallLog = require('../models/CallLog');
+const User = require('../models/User');
+const mongoose = require('mongoose');
 
 // @desc    Create a new call log entry
 // @route   POST /api/calls
@@ -7,8 +9,22 @@ const logCall = async (req, res) => {
   try {
     const { callId, receiverId, callType, status, duration } = req.body;
 
-    if (!callId || !receiverId || !status) {
-      return res.status(400).json({ message: 'Call ID, receiver ID, and status are required' });
+    if (
+      typeof callId !== 'string' ||
+      !callId ||
+      !mongoose.Types.ObjectId.isValid(receiverId) ||
+      !['audio', 'video'].includes(callType || 'audio') ||
+      !['completed', 'missed', 'rejected', 'outgoing'].includes(status) ||
+      (duration !== undefined && (!Number.isFinite(duration) || duration < 0))
+    ) {
+      return res.status(400).json({ message: 'Invalid call log details' });
+    }
+
+    if (String(receiverId) === String(req.user._id)) {
+      return res.status(400).json({ message: 'Cannot create a call log for yourself' });
+    }
+    if (!await User.exists({ _id: receiverId })) {
+      return res.status(404).json({ message: 'Call recipient not found' });
     }
 
     const newCallLog = await CallLog.findOneAndUpdate(
@@ -20,7 +36,7 @@ const logCall = async (req, res) => {
           receiver: receiverId,
           callType: callType || 'audio',
           status,
-          duration: duration || 0,
+          duration: duration ?? 0,
         },
       },
       { new: true, upsert: true, runValidators: true }
@@ -42,7 +58,7 @@ const logCall = async (req, res) => {
 // @access  Private
 const getCallHistory = async (req, res) => {
   try {
-    const userId = req.user._id;
+    const userId = req.user._id || req.user.id;
 
     // Find all logs where the user is either the caller or the receiver
     const callLogs = await CallLog.find({

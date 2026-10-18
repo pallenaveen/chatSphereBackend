@@ -54,11 +54,14 @@ exports.loginUser = async (req, res) => {
 
 // Search users by username or email (/api/users?search=query)
 exports.allUsers = async (req, res) => {
-    const keyword = req.query.search
+    const search = typeof req.query.search === 'string'
+        ? req.query.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        : '';
+    const keyword = search
         ? {
               $or: [
-                  { username: { $regex: req.query.search, $options: 'i' } },
-                  { email: { $regex: req.query.search, $options: 'i' } },
+                  { username: { $regex: search, $options: 'i' } },
+                  { email: { $regex: search, $options: 'i' } },
               ],
           }
         : {};
@@ -67,7 +70,7 @@ exports.allUsers = async (req, res) => {
         // Find matching users excluding the logged-in user
         const users = await User.find(keyword)
             .find({ _id: { $ne: req.user._id } })
-            .select('-password');
+            .select('_id username avatar bio lastSeen isOnline');
             
         res.status(200).json(users);
     } catch (error) {
@@ -78,7 +81,7 @@ exports.allUsers = async (req, res) => {
 exports.getUserProfile = async (req, res) => {
     try {
         const user = await User.findById(req.params.userId)
-            .select('_id username email avatar bio lastSeen isOnline');
+            .select('_id username avatar bio lastSeen isOnline');
 
         if (!user) {
             return res.status(404).json({ message: 'User not found' });

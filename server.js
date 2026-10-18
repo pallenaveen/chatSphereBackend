@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const connectDB = require('./config/db');
@@ -11,6 +12,8 @@ const messageRoutes = require('./routes/messageRoutes');
 const callRoutes = require('./routes/callRoutes'); // 📞 Import call routes
 const Message = require('./models/Message'); 
 const User = require('./models/User'); 
+const Conversation = require('./models/Conversation');
+const mongoose = require('mongoose');
 
 const app = express();
 
@@ -43,6 +46,26 @@ const io = new Server(server, {
     }
 });
 
+io.use((socket, next) => {
+    try {
+        const token = socket.handshake.auth?.token;
+        if (!token) {
+            return next(new Error('Not authorized'));
+        }
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const userId = decoded._id || decoded.id;
+        if (!mongoose.Types.ObjectId.isValid(userId)) {
+            return next(new Error('Not authorized'));
+        }
+
+        socket.userId = String(userId);
+        return next();
+    } catch {
+        return next(new Error('Not authorized'));
+    }
+});
+
 // Bind io to express app so REST controllers can trigger socket emissions
 app.set('io', io);
 
@@ -53,69 +76,72 @@ const activeCalls = new Map();
 // Socket.IO Connection Handler
 io.on('connection', (socket) => {
     console.log('User connected to socket:', socket.id);
+    const isAuthorizedRoom = async (room) => {
+        if (!mongoose.Types.ObjectId.isValid(room) || !socket.rooms.has(String(room))) {
+            return false;
+        }
+        return Boolean(await Conversation.exists({ _id: room, members: socket.userId }));
+    };
+    let authenticatedUserPromise;
 
     // Register user
-    socket.on('setup_user', (userId) => {
-        if (userId) {
-            const uidStr = String(userId);
-            socket.userId = uidStr;
+    socket.on('setup_user', async () => {
+        if (socket.userId) {
+            const uidStr = socket.userId;
             const userSockets = onlineUsers.get(uidStr) || new Set();
+            const wasOnline = userSockets.size > 0;
             userSockets.add(socket.id);
             onlineUsers.set(uidStr, userSockets);
             socket.join(`user:${uidStr}`);
-            
-            // Broadcast online list and online status update
+
+            if (!wasOnline) {
+                const lastSeen = new Date();
+                try {
+                    await User.findByIdAndUpdate(uidStr, { isOnline: true });
+                } catch (error) {
+                    console.error('Failed to update online status:', error);
+                }
+                io.emit('user_status_change', {
+                    userId: uidStr,
+                    isOnline: true,
+                    lastSeen,
+                });
+            }
+
             io.emit('get_online_users', Array.from(onlineUsers.keys()));
-            io.emit('user_status_change', {
-                userId: uidStr,
-                isOnline: true,
-                lastSeen: new Date()
-            });
         }
     });
 
     // Join chat room
-    socket.on('join_room', (room) => {
-        socket.join(room);
-    });
-
-    // Send message
-    socket.on('send_message', (newMessage) => {
-        const conversationId = typeof newMessage.conversationId === 'object' 
-            ? newMessage.conversationId._id 
-            : newMessage.conversationId;
-
-        if (conversationId) {
-            socket.broadcast.to(conversationId).emit('receive_message', newMessage);
-        }
-    });
-
-    // Delete message event
-    socket.on('delete_message', ({ messageId, conversationId }) => {
-        if (conversationId && messageId) {
-            socket.to(conversationId).emit('message_deleted', { messageId });
-        }
-    });
-
-    // Edit message event
-    socket.on('edit_message', (updatedMsg) => {
-        const conversationId = typeof updatedMsg.conversationId === 'object' 
-            ? updatedMsg.conversationId._id 
-            : updatedMsg.conversationId;
-
-        if (conversationId) {
-            socket.to(conversationId).emit('message_edited', updatedMsg);
+    socket.on('join_room', async (room) => {
+        try {
+            if (
+                mongoose.Types.ObjectId.isValid(room) &&
+                await Conversation.exists({ _id: room, members: socket.userId })
+            ) {
+                socket.join(String(room));
+            }
+        } catch (error) {
+            console.error('Failed to authorize conversation room join:', error);
         }
     });
 
     // Add / Toggle Emoji Reaction Event
-    socket.on('add_reaction', async ({ messageId, emoji, userId, conversationId }) => {
+    socket.on('add_reaction', async ({ messageId, emoji, conversationId }) => {
         try {
-            const message = await Message.findById(messageId);
-            if (!message) return;
+            if (
+                !mongoose.Types.ObjectId.isValid(conversationId) ||
+                !socket.rooms.has(String(conversationId)) ||
+                !await Conversation.exists({ _id: conversationId, members: socket.userId })
+            ) {
+                return;
+            }
+
+            const message = await Message.findOne({ _id: messageId, conversationId });
+            if (!message || typeof emoji !== 'string' || !emoji) return;
 
             const existingIndex = message.reactions.findIndex(
-                (r) => r.user.toString() === userId.toString()
+                (r) => r.user.toString() === socket.userId
             );
 
             if (existingIndex > -1) {
@@ -125,7 +151,7 @@ io.on('connection', (socket) => {
                     message.reactions[existingIndex].emoji = emoji;
                 }
             } else {
-                message.reactions.push({ user: userId, emoji });
+                message.reactions.push({ user: socket.userId, emoji });
             }
 
             await message.save();
@@ -142,30 +168,27 @@ io.on('connection', (socket) => {
     });
 
     // Typing indicators
-    socket.on('typing', ({ room, username }) => {
-        if (room) {
-            socket.to(room).emit('typing', { room, username });
+    socket.on('typing', async ({ room } = {}) => {
+        try {
+            if (await isAuthorizedRoom(room)) {
+                authenticatedUserPromise ||= User.findById(socket.userId).select('username').lean();
+                const user = await authenticatedUserPromise;
+                if (user) {
+                    socket.to(String(room)).emit('typing', { room, username: user.username });
+                }
+            }
+        } catch (error) {
+            console.error('Failed to authorize typing event:', error);
         }
     });
 
-    socket.on('stop_typing', ({ room }) => {
-        if (room) {
-            socket.to(room).emit('stop_typing', { room });
-        }
-    });
-
-    // Broadcast read receipt when opening a chat room
-    socket.on('mark_chat_as_read', ({ conversationId, userId }) => {
-        if (conversationId) {
-            io.in(conversationId).emit('chat_marked_read', { conversationId, userId });
-            socket.to(conversationId).emit('chat_marked_read', { conversationId, userId });
-        }
-    });
-
-    // Single message read listener
-    socket.on('mark_as_read', ({ messageId, conversationId, userId }) => {
-        if (conversationId) {
-            socket.in(conversationId).emit('message_read', { messageId, userId });
+    socket.on('stop_typing', async ({ room } = {}) => {
+        try {
+            if (await isAuthorizedRoom(room)) {
+                socket.to(String(room)).emit('stop_typing', { room });
+            }
+        } catch (error) {
+            console.error('Failed to authorize stop-typing event:', error);
         }
     });
 
@@ -192,7 +215,10 @@ io.on('connection', (socket) => {
             const lastSeenTime = new Date();
 
             try {
-                await User.findByIdAndUpdate(disconnectedUserId, { lastSeen: lastSeenTime });
+                await User.findByIdAndUpdate(disconnectedUserId, {
+                    isOnline: false,
+                    lastSeen: lastSeenTime,
+                });
             } catch (err) {
                 console.error('Failed to update lastSeen in DB:', err);
             }
@@ -207,9 +233,9 @@ io.on('connection', (socket) => {
     });
 
     // 📞 User initiates a call (Signaling relay)
-    socket.on('call_user', ({ callId, userToCall, signalData, from, callType, name, avatar }) => {
+    socket.on('call_user', ({ callId, userToCall, signalData, callType, name, avatar }) => {
         const targetId = String(userToCall || '');
-        const callerId = socket.userId || String(from || '');
+        const callerId = socket.userId;
         const targetSocketIds = onlineUsers.get(targetId);
         const targetSocketId = targetSocketIds ? Array.from(targetSocketIds).at(-1) : null;
         if (!callId || !targetSocketId || !callerId) {
