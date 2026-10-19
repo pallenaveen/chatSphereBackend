@@ -76,6 +76,7 @@ const activeCalls = new Map();
 // Socket.IO Connection Handler
 io.on('connection', (socket) => {
     console.log('User connected to socket:', socket.id);
+    socket.join(`user:${socket.userId}`);
     const isAuthorizedRoom = async (room) => {
         if (!mongoose.Types.ObjectId.isValid(room) || !socket.rooms.has(String(room))) {
             return false;
@@ -92,8 +93,6 @@ io.on('connection', (socket) => {
             const wasOnline = userSockets.size > 0;
             userSockets.add(socket.id);
             onlineUsers.set(uidStr, userSockets);
-            socket.join(`user:${uidStr}`);
-
             if (!wasOnline) {
                 const lastSeen = new Date();
                 try {
@@ -198,11 +197,11 @@ io.on('connection', (socket) => {
         
         const disconnectedUserId = socket.userId;
         for (const [callId, call] of activeCalls.entries()) {
-            if (call.callerSocketId === socket.id || call.targetSocketId === socket.id) {
-                const otherSocketId = call.callerSocketId === socket.id
-                    ? call.targetSocketId
-                    : call.callerSocketId;
-                io.to(otherSocketId).emit('call_ended', { callId, status: 'missed' });
+            if (call.callerSocketId === socket.id) {
+                io.to(`user:${call.targetId}`).emit('call_ended', { callId, status: 'missed' });
+                activeCalls.delete(callId);
+            } else if (call.targetSocketId === socket.id) {
+                io.to(call.callerSocketId).emit('call_ended', { callId, status: 'missed' });
                 activeCalls.delete(callId);
             }
         }
@@ -236,9 +235,9 @@ io.on('connection', (socket) => {
     socket.on('call_user', ({ callId, userToCall, signalData, callType, name, avatar }) => {
         const targetId = String(userToCall || '');
         const callerId = socket.userId;
-        const targetSocketIds = onlineUsers.get(targetId);
-        const targetSocketId = targetSocketIds ? Array.from(targetSocketIds).at(-1) : null;
-        if (!callId || !targetSocketId || !callerId) {
+        const targetRoom = `user:${targetId}`;
+        const targetIsOnline = io.sockets.adapter.rooms.get(targetRoom)?.size > 0;
+        if (!callId || !targetIsOnline || !callerId || targetId === callerId) {
             if (callId) socket.emit('call_ended', { callId, status: 'missed' });
             return;
         }
@@ -247,27 +246,26 @@ io.on('connection', (socket) => {
             callerId,
             targetId,
             callerSocketId: socket.id,
-            targetSocketId,
+            targetSocketId: null,
             accepted: false,
         });
 
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('incoming_call', {
-                callId,
-                signal: signalData,
-                from: callerId,
-                callType,
-                name,
-                avatar 
-            });
-        }
+        io.to(targetRoom).emit('incoming_call', {
+            callId,
+            signal: signalData,
+            from: callerId,
+            callType,
+            name,
+            avatar
+        });
     });
 
     // User answers an incoming call (Relays answer signal back to caller)
     socket.on('answer_call', (data) => {
-        const call = activeCalls.get(data.callId);
-        if (!call || call.targetSocketId !== socket.id || call.accepted) return;
+        const call = activeCalls.get(data?.callId);
+        if (!call || call.targetId !== socket.userId || call.accepted) return;
         call.accepted = true;
+        call.targetSocketId = socket.id;
         io.to(call.callerSocketId).emit('call_accepted', {
             callId: data.callId,
             signal: data.signal,
@@ -278,13 +276,15 @@ io.on('connection', (socket) => {
     socket.on('hang_up', ({ callId, status }) => {
         const call = activeCalls.get(callId);
         if (!call) return;
-        const targetSocketId = call.callerSocketId === socket.id
-            ? call.targetSocketId
-            : call.targetSocketId === socket.id
-                ? call.callerSocketId
-                : null;
-        if (!targetSocketId) return;
-        io.to(targetSocketId).emit('call_ended', { callId, status });
+        const isCaller = call.callerId === socket.userId && call.callerSocketId === socket.id;
+        const isTarget = call.targetId === socket.userId;
+        if (!isCaller && !isTarget) return;
+        const otherPartyRoom = isCaller ? `user:${call.targetId}` : null;
+        if (otherPartyRoom) {
+            io.to(otherPartyRoom).emit('call_ended', { callId, status });
+        } else {
+            io.to(call.callerSocketId).emit('call_ended', { callId, status });
+        }
         activeCalls.delete(callId);
     });
 });
