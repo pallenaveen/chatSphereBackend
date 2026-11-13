@@ -1,6 +1,7 @@
-const Message = require('../models/Message');
-const { findConversationForMember } = require('../utils/conversationAccess');
-const { emitToConversationMembers } = require('../utils/realtime');
+const Message = require('../../models/Message');
+const mongoose = require('mongoose');
+const { findConversationForMember } = require('../../utils/conversationAccess');
+const { emitToConversationMembers } = require('../../utils/realtime');
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const MAX_MESSAGE_LENGTH = 10000;
 const MAX_MEDIA_LENGTH = 15 * 1024 * 1024;
@@ -104,8 +105,38 @@ const allMessages = async (req, res) => {
             return res.status(404).json({ message: "Conversation not found" });
         }
 
-        const messages = await Message.find({ conversationId: req.params.conversationId })
-            .populate("sender", "username avatar");
+        const filter = { conversationId: conversation._id };
+        const pageSize = Number.parseInt(req.query.limit, 10);
+        const isPaginated = Number.isInteger(pageSize) && pageSize > 0;
+        if (isPaginated && req.query.before && req.query.beforeId) {
+            const beforeDate = new Date(req.query.before);
+            if (
+                Number.isNaN(beforeDate.getTime()) ||
+                !mongoose.Types.ObjectId.isValid(req.query.beforeId)
+            ) {
+                return res.status(400).json({ message: 'Invalid message cursor' });
+            }
+            filter.$or = [
+                { createdAt: { $lt: beforeDate } },
+                { createdAt: beforeDate, _id: { $lt: req.query.beforeId } },
+            ];
+        }
+
+        let query = Message.find(filter)
+                .populate("sender", "username avatar");
+        if (isPaginated) {
+            const limit = Math.min(pageSize, 100);
+            query = query
+                .sort({ createdAt: -1, _id: -1 })
+                .limit(limit + 1);
+            const messages = await query;
+            const hasMore = messages.length > limit;
+            const pageMessages = messages.slice(0, limit).reverse();
+            res.set('X-Has-More', String(hasMore));
+            return res.status(200).json(pageMessages);
+        }
+
+        const messages = await query;
         res.status(200).json(messages);
     } catch (error) {
         res.status(500).json({ message: error.message });

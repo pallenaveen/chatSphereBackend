@@ -33,5 +33,7 @@ const callLogSchema = new mongoose.Schema({
 });
 
 callLogSchema.index({ callId: 1 }, { unique: true, sparse: true });
+callLogSchema.index({ caller: 1, createdAt: -1 });
+callLogSchema.index({ receiver: 1, createdAt: -1 });
 
 module.exports = mongoose.model('CallLog', callLogSchema);

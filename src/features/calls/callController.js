@@ -1,5 +1,5 @@
-const CallLog = require('../models/CallLog');
-const User = require('../models/User');
+const CallLog = require('../../models/CallLog');
+const User = require('../../models/User');
 const mongoose = require('mongoose');
 
 // @desc    Create a new call log entry
@@ -39,7 +39,7 @@ const logCall = async (req, res) => {
           duration: duration ?? 0,
         },
       },
-      { new: true, upsert: true, runValidators: true }
+      { returnDocument: 'after', upsert: true, runValidators: true }
     );
 
     const populatedLog = await CallLog.findById(newCallLog._id)
@@ -59,16 +59,43 @@ const logCall = async (req, res) => {
 const getCallHistory = async (req, res) => {
   try {
     const userId = req.user._id || req.user.id;
+    const pageSize = Number.parseInt(req.query.limit, 10);
+    const isPaginated = Number.isInteger(pageSize) && pageSize > 0;
+    const filter = {
+      $or: [{ caller: userId }, { receiver: userId }],
+    };
 
-    // Find all logs where the user is either the caller or the receiver
-    const callLogs = await CallLog.find({
-      $or: [{ caller: userId }, { receiver: userId }]
-    })
+    if (isPaginated && req.query.before && req.query.beforeId) {
+      const beforeDate = new Date(req.query.before);
+      if (
+        Number.isNaN(beforeDate.getTime()) ||
+        !mongoose.Types.ObjectId.isValid(req.query.beforeId)
+      ) {
+        return res.status(400).json({ message: 'Invalid call-history cursor' });
+      }
+      filter.$and = [{
+        $or: [
+          { createdAt: { $lt: beforeDate } },
+          { createdAt: beforeDate, _id: { $lt: req.query.beforeId } },
+        ],
+      }];
+    }
+
+    let query = CallLog.find(filter)
       .populate('caller', 'username name avatar')
       .populate('receiver', 'username name avatar')
-      .sort({ createdAt: -1 }); // Most recent first
+      .sort({ createdAt: -1, _id: -1 });
+    if (isPaginated) {
+      const limit = Math.min(pageSize, 100);
+      query = query.limit(limit + 1);
+      const callLogs = await query;
+      const hasMore = callLogs.length > limit;
+      const pageLogs = (hasMore ? callLogs.slice(0, limit) : callLogs);
+      res.set('X-Has-More', String(hasMore));
+      return res.json(pageLogs);
+    }
 
-    res.json(callLogs);
+    res.json(await query);
   } catch (err) {
     console.error('Error fetching call history:', err);
     res.status(500).json({ message: 'Server error while fetching call history' });

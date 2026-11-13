@@ -6,12 +6,12 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const connectDB = require('./config/db');
-const authRoutes = require('./routes/authRoutes');
-const chatRoutes = require('./routes/chatRoutes');
-const messageRoutes = require('./routes/messageRoutes');
-const callRoutes = require('./routes/callRoutes'); // 📞 Import call routes
-const Message = require('./models/Message'); 
-const User = require('./models/User'); 
+const authRoutes = require('./features/auth/authRoutes');
+const chatRoutes = require('./features/chats/chatRoutes');
+const messageRoutes = require('./features/chats/messageRoutes');
+const callRoutes = require('./features/calls/callRoutes');
+const Message = require('./models/Message');
+const User = require('./models/User');
 const Conversation = require('./models/Conversation');
 const mongoose = require('mongoose');
 
@@ -21,9 +21,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-// Database connection
-connectDB();
 
 // REST API endpoints
 app.get('/', (req, res) => {
@@ -192,8 +189,8 @@ io.on('connection', (socket) => {
     });
 
     // Disconnect Handler
-    socket.on('disconnect', async () => {
-        console.log('User disconnected from socket:', socket.id);
+    socket.on('disconnect', async (reason) => {
+        console.log('User disconnected from socket:', socket.id, reason);
         
         const disconnectedUserId = socket.userId;
         for (const [callId, call] of activeCalls.entries()) {
@@ -232,13 +229,23 @@ io.on('connection', (socket) => {
     });
 
     // 📞 User initiates a call (Signaling relay)
-    socket.on('call_user', ({ callId, userToCall, signalData, callType, name, avatar }) => {
+    socket.on('call_user', ({ callId, userToCall, callType, name, avatar }, acknowledge) => {
+        const respond = typeof acknowledge === 'function' ? acknowledge : () => {};
         const targetId = String(userToCall || '');
         const callerId = socket.userId;
         const targetRoom = `user:${targetId}`;
-        const targetIsOnline = io.sockets.adapter.rooms.get(targetRoom)?.size > 0;
+        const targetSocketCount = io.sockets.adapter.rooms.get(targetRoom)?.size || 0;
+        const targetIsOnline = targetSocketCount > 0;
         if (!callId || !targetIsOnline || !callerId || targetId === callerId) {
+            console.warn('Call invitation rejected:', {
+                callerConnected: Boolean(callerId),
+                targetConnected: targetIsOnline,
+                targetSocketCount,
+                selfCall: targetId === callerId,
+                hasCallId: Boolean(callId),
+            });
             if (callId) socket.emit('call_ended', { callId, status: 'missed' });
+            respond({ ok: false, reason: targetIsOnline ? 'invalid_call' : 'recipient_offline' });
             return;
         }
 
@@ -247,29 +254,83 @@ io.on('connection', (socket) => {
             targetId,
             callerSocketId: socket.id,
             targetSocketId: null,
+            offerReceived: false,
             accepted: false,
         });
 
         io.to(targetRoom).emit('incoming_call', {
             callId,
-            signal: signalData,
             from: callerId,
             callType,
             name,
             avatar
         });
+        console.info('Call invitation routed:', { targetSocketCount, callType });
+        respond({ ok: true });
+    });
+
+    socket.on('call_invite_received', ({ callId }) => {
+        const call = activeCalls.get(callId);
+        if (!call || call.targetId !== socket.userId) return;
+        io.to(call.callerSocketId).emit('call_invite_received', { callId });
+    });
+
+    socket.on('call_offer', ({ callId, signal }, acknowledge) => {
+        const respond = typeof acknowledge === 'function' ? acknowledge : () => {};
+        const call = activeCalls.get(callId);
+        const rejectionReason = !call
+            ? 'call_not_found'
+            : call.callerId !== socket.userId || call.callerSocketId !== socket.id
+                ? 'caller_mismatch'
+                : !signal || typeof signal !== 'object' || Array.isArray(signal)
+                    ? 'invalid_signal'
+                    : null;
+        if (rejectionReason) {
+            console.warn('Call offer rejected:', { callId, reason: rejectionReason });
+            respond({ ok: false, reason: rejectionReason });
+            return;
+        }
+
+        const isFirstOfferSignal = !call.offerReceived;
+        call.offerReceived = true;
+        io.to(`user:${call.targetId}`).emit('call_offer', { callId, signal });
+        if (isFirstOfferSignal) {
+            console.info('Call offer relayed:', { callId, targetId: call.targetId });
+        }
+        respond({ ok: true });
     });
 
     // User answers an incoming call (Relays answer signal back to caller)
-    socket.on('answer_call', (data) => {
+    socket.on('answer_call', (data, acknowledge) => {
+        const respond = typeof acknowledge === 'function' ? acknowledge : () => {};
         const call = activeCalls.get(data?.callId);
-        if (!call || call.targetId !== socket.userId || call.accepted) return;
+        const rejectionReason = !call
+            ? 'call_not_found'
+            : call.targetId !== socket.userId
+                ? 'recipient_mismatch'
+                : !call.offerReceived
+                    ? 'offer_not_received'
+                    : call.accepted && call.targetSocketId !== socket.id
+                        ? 'recipient_socket_mismatch'
+                        : !data.signal || typeof data.signal !== 'object' || Array.isArray(data.signal)
+                            ? 'invalid_signal'
+                            : null;
+        if (rejectionReason) {
+            console.warn('Call answer rejected:', { callId: data?.callId, reason: rejectionReason });
+            respond({ ok: false, reason: rejectionReason });
+            return;
+        }
+        const isFirstAnswerSignal = !call.accepted;
         call.accepted = true;
         call.targetSocketId = socket.id;
         io.to(call.callerSocketId).emit('call_accepted', {
             callId: data.callId,
             signal: data.signal,
         });
+        if (isFirstAnswerSignal) {
+            console.info('Call answer relayed:', { callId: data.callId, callerId: call.callerId });
+        }
+        respond({ ok: true });
     });
 
     // Handle call hangup / rejection
@@ -290,4 +351,11 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+connectDB()
+    .then(() => {
+        server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    })
+    .catch((error) => {
+        console.error('Server startup failed:', error);
+        process.exitCode = 1;
+    });

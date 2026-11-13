@@ -1,4 +1,4 @@
-const User = require('../models/User');
+const User = require('../../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
@@ -93,6 +93,91 @@ exports.getUserProfile = async (req, res) => {
             return res.status(400).json({ message: 'Invalid user ID' });
         }
         return res.status(500).json({ message: error.message });
+    }
+};
+
+exports.getRingtone = async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id)
+            .select('ringtone')
+            .lean();
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        return res.status(200).json({ ringtone: user.ringtone?.data ? user.ringtone : null });
+    } catch (error) {
+        console.error('Error fetching saved ringtone:', error);
+        return res.status(500).json({ message: 'Could not load the saved ringtone' });
+    }
+};
+
+exports.saveRingtone = async (req, res) => {
+    const { data, fileName } = req.body;
+    const dataUrlMatch = typeof data === 'string'
+        ? data.match(/^data:(audio\/(?:mpeg|mp3|wav|x-wav|ogg|mp4|aac|webm));base64,([A-Za-z0-9+/]+={0,2})$/i)
+        : null;
+
+    if (
+        !dataUrlMatch ||
+        typeof fileName !== 'string' ||
+        !fileName.trim() ||
+        fileName.length > 255 ||
+        !Buffer.from(dataUrlMatch[2], 'base64').length
+    ) {
+        return res.status(400).json({ message: 'Choose a valid MP3, WAV, OGG, M4A, AAC, or WebM audio file.' });
+    }
+
+    const audioSize = Buffer.from(dataUrlMatch[2], 'base64').length;
+    const MAX_RINGTONE_SIZE = 5 * 1024 * 1024;
+    if (audioSize > MAX_RINGTONE_SIZE) {
+        return res.status(413).json({ message: 'Ringtone files must be 5 MiB or smaller.' });
+    }
+
+    try {
+        const user = await User.findByIdAndUpdate(
+            req.user._id,
+            {
+                $set: {
+                    ringtone: {
+                        data,
+                        fileName: fileName.trim(),
+                        mimeType: dataUrlMatch[1].toLowerCase(),
+                    },
+                },
+            },
+            { new: true, runValidators: true }
+        ).select('_id');
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        return res.status(200).json({
+            ringtone: {
+                fileName: fileName.trim(),
+                mimeType: dataUrlMatch[1].toLowerCase(),
+            },
+        });
+    } catch (error) {
+        console.error('Error saving ringtone:', error);
+        return res.status(500).json({ message: 'Could not save the ringtone' });
+    }
+};
+
+exports.deleteRingtone = async (req, res) => {
+    try {
+        const user = await User.findByIdAndUpdate(
+            req.user._id,
+            { $set: { ringtone: { data: '', fileName: '', mimeType: '' } } },
+            { new: true, runValidators: true }
+        ).select('_id');
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        return res.status(200).json({ ringtone: null });
+    } catch (error) {
+        console.error('Error resetting ringtone:', error);
+        return res.status(500).json({ message: 'Could not reset the ringtone' });
     }
 };
 

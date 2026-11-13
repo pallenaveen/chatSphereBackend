@@ -1,9 +1,9 @@
-const Conversation = require('../models/Conversation');
-const Message = require('../models/Message');
-const User = require('../models/User');
+const Conversation = require('../../models/Conversation');
+const Message = require('../../models/Message');
+const User = require('../../models/User');
 const mongoose = require('mongoose');
-const { findConversationForMember } = require('../utils/conversationAccess');
-const { emitToConversationMembers } = require('../utils/realtime');
+const { findConversationForMember } = require('../../utils/conversationAccess');
+const { emitToConversationMembers } = require('../../utils/realtime');
 
 // Create 1-on-1 conversation or return existing
 const accessChat = async (req, res) => {
@@ -71,7 +71,7 @@ const fetchChats = async (req, res) => {
     let chats = await Conversation.find({ members: { $in: [currentObjId] } })
       .populate("members", "username avatar bio lastSeen isOnline")
       .populate("groupAdmin", "username avatar")
-      .populate("latestMessage")
+      .populate("latestMessage", "content createdAt sender")
       .sort({ updatedAt: -1 })
       .lean();
 
@@ -80,20 +80,23 @@ const fetchChats = async (req, res) => {
       select: "username avatar"
     });
 
-    const chatsWithUnreadCount = await Promise.all(
-      chats.map(async (chat) => {
-        const unreadCount = await Message.countDocuments({
-          conversationId: chat._id,
+    const unreadCounts = await Message.aggregate([
+      {
+        $match: {
+          conversationId: { $in: chats.map((chat) => chat._id) },
           sender: { $ne: currentObjId },
-          readBy: { $ne: currentObjId }
-        });
-
-        return {
-          ...chat,
-          unreadCount
-        };
-      })
+          readBy: { $ne: currentObjId },
+        },
+      },
+      { $group: { _id: '$conversationId', unreadCount: { $sum: 1 } } },
+    ]);
+    const unreadCountByConversation = new Map(
+      unreadCounts.map(({ _id, unreadCount }) => [String(_id), unreadCount])
     );
+    const chatsWithUnreadCount = chats.map((chat) => ({
+      ...chat,
+      unreadCount: unreadCountByConversation.get(String(chat._id)) || 0,
+    }));
 
     res.status(200).json(chatsWithUnreadCount);
   } catch (error) {
@@ -149,10 +152,55 @@ const deleteChat = async (req, res) => {
       return res.status(403).json({ message: 'Only the group admin can delete this group' });
     }
 
+    const io = req.app.get('io');
     await Message.deleteMany({ conversationId: conversation._id });
     await conversation.deleteOne();
-    req.app.get('io')?.in(String(conversation._id)).socketsLeave(String(conversation._id));
+    if (io) {
+      emitToConversationMembers(io, conversation, 'conversation_deleted', {
+        conversationId: String(conversation._id),
+      });
+    }
+    io?.in(String(conversation._id)).socketsLeave(String(conversation._id));
     res.status(200).json({ message: 'Chat deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+const leaveGroup = async (req, res) => {
+  try {
+    const chatId = req.params.id;
+    const currentUserId = req.user._id || req.user.id;
+    const conversation = await findConversationForMember(chatId, currentUserId);
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found' });
+    }
+    if (!conversation.isGroup) {
+      return res.status(400).json({ message: 'Only group members can leave a group' });
+    }
+    if (String(conversation.groupAdmin) === String(currentUserId)) {
+      return res.status(400).json({ message: 'The group admin must delete the group instead of leaving it' });
+    }
+
+    const updatedChat = await Conversation.findByIdAndUpdate(
+      chatId,
+      { $pull: { members: currentUserId } },
+      { new: true }
+    )
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar");
+
+    if (!updatedChat) {
+      return res.status(404).json({ message: 'Conversation not found' });
+    }
+
+    const io = req.app.get('io');
+    if (io) {
+      io.in(`user:${String(currentUserId)}`).socketsLeave(String(conversation._id));
+      io.to(String(conversation._id)).emit('group_updated', updatedChat);
+    }
+
+    res.status(200).json({ message: 'You left the group successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -163,7 +211,7 @@ const createGroupChat = async (req, res) => {
   const { name, members, users } = req.body;
   const currentUserId = req.user._id || req.user.id;
 
-  if (!name || (!members && !users)) {
+  if (typeof name !== 'string' || !name.trim() || (!members && !users)) {
     return res.status(400).json({ message: 'Please fill all fields' });
   }
 
@@ -202,11 +250,29 @@ const createGroupChat = async (req, res) => {
       return res.status(400).json({ message: 'One or more group members do not exist' });
     }
 
+    const groupName = name.trim();
+    const groupKey = JSON.stringify([
+      groupName.toLocaleLowerCase(),
+      parsedMembers.map(String).sort(),
+    ]);
+    const existingGroup = await Conversation.findOne({
+      chatName: groupName,
+      isGroup: true,
+      members: { $all: parsedMembers, $size: parsedMembers.length },
+    })
+      .populate("members", "username avatar bio lastSeen isOnline")
+      .populate("groupAdmin", "username avatar");
+
+    if (existingGroup) {
+      return res.status(200).json(existingGroup);
+    }
+
     const groupChat = await Conversation.create({
-      chatName: name,
+      chatName: groupName,
       isGroup: true,
       members: parsedMembers,
-      groupAdmin: currentUserId
+      groupAdmin: currentUserId,
+      groupKey,
     });
 
     const fullGroupChat = await Conversation.findOne({ _id: groupChat._id })
@@ -222,6 +288,19 @@ const createGroupChat = async (req, res) => {
 
     res.status(200).json(fullGroupChat);
   } catch (error) {
+    if (error.code === 11000) {
+      const groupKey = JSON.stringify([
+        name.trim().toLocaleLowerCase(),
+        [...new Set(parsedMembers.map(String))].sort(),
+      ]);
+      const existingGroup = await Conversation.findOne({ groupKey })
+        .populate("members", "username avatar bio lastSeen isOnline")
+        .populate("groupAdmin", "username avatar");
+
+      if (existingGroup) {
+        return res.status(200).json(existingGroup);
+      }
+    }
     res.status(500).json({ message: error.message });
   }
 };
@@ -406,6 +485,7 @@ module.exports = {
   fetchChats,
   markMessagesAsRead,
   deleteChat,
+  leaveGroup,
   createGroupChat,
   renameGroup,
   addToGroup,

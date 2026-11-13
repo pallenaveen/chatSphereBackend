@@ -82,4 +82,7 @@ const messageSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+messageSchema.index({ conversationId: 1, createdAt: -1, _id: -1 });
+messageSchema.index({ conversationId: 1, sender: 1, readBy: 1 });
+
 module.exports = mongoose.model('Message', messageSchema);

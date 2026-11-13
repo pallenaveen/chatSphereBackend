@@ -6,8 +6,8 @@ const {
   markDelivered,
   editMessage, 
   deleteMessage 
-} = require('../controllers/messageController');
-const { protect } = require('../middleware/authMiddleware');
+} = require('./messageController');
+const { protect } = require('../../middleware/authMiddleware');
 const router = express.Router();
 
 router.route('/').post(protect, sendMessage);

@@ -24,6 +24,22 @@ const userSchema = new mongoose.Schema({
         default: "",
         maxlength: 139
     },
+    ringtone: {
+        data: {
+            type: String,
+            default: "",
+            maxlength: 8 * 1024 * 1024
+        },
+        fileName: {
+            type: String,
+            default: "",
+            maxlength: 255
+        },
+        mimeType: {
+            type: String,
+            default: ""
+        }
+    },
     isOnline: {
         type: Boolean,
         default: false

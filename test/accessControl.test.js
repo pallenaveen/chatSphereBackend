@@ -1,10 +1,10 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const jwt = require('jsonwebtoken');
-const Conversation = require('../models/Conversation');
-const { protect } = require('../middleware/authMiddleware');
-const { findConversationForMember } = require('../utils/conversationAccess');
-const { emitToConversationMembers } = require('../utils/realtime');
+const Conversation = require('../src/models/Conversation');
+const { protect } = require('../src/middleware/authMiddleware');
+const { findConversationForMember } = require('../src/utils/conversationAccess');
+const { emitToConversationMembers } = require('../src/utils/realtime');
 
 test('authentication middleware normalizes the token ID as _id', () => {
   const userId = '507f1f77bcf86cd799439011';

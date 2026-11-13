@@ -7,10 +7,11 @@ const {
   addToGroup,
   removeFromGroup,
   deleteChat,
+  leaveGroup,
   markMessagesAsRead,
   toggleFavorite
-} = require('../controllers/chatController');
-const { protect } = require('../middleware/authMiddleware');
+} = require('./chatController');
+const { protect } = require('../../middleware/authMiddleware');
 
 const router = express.Router();
 
@@ -23,6 +24,7 @@ router.put('/favorite/:id', protect, toggleFavorite);
 router.put('/read/:chatId', protect, markMessagesAsRead);
 
 // Delete chat
+router.delete('/group/:id/leave', protect, leaveGroup);
 router.delete('/:id', protect, deleteChat);
 
 // Group Chat Operations
